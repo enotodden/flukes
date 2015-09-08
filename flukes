@@ -92,7 +92,7 @@ def tail_container_logs(containers, **kwargs):
             x = q.get_nowait()
         except Queue.Empty:
             # Sleep a bit during "slow" periods.
-            # Makes our tight loop a bit less thigh and saves some battery :)
+            # Makes our tight loop a bit less tight and saves some battery :)
             time.sleep(0.1)
         else:
             container = x["container"]
