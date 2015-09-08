@@ -25,6 +25,7 @@ import subprocess
 import threading
 import Queue
 import argparse
+import re
 
 COLORS = {
     "grey": 30,
@@ -48,7 +49,7 @@ def colored(s, color):
     return s
 
 class ColorPicker(object):
-    possible_colors = ["red", "green", "yellow", "blue", "magenta", "cyan", "white"]
+    possible_colors = COLORS.keys()
     def __init__(self):
         self.color_index = 0
     def pick(self):
@@ -58,45 +59,107 @@ class ColorPicker(object):
             self.color_index = 0
         return c
 
-def enqueue_output(out, queue, container):
-    for line in iter(out.readline, b''):
-        queue.put({"line": line, "container":container})
-    out.close()
 
-def tail_container_logs(containers, **kwargs):
-    cp = ColorPicker()
-    container_colors = {}
+ALL_CONTAINERS = "all"
 
-    docker_logs_cmd = ["docker", "logs", "-f"]
-    tailn = kwargs.get("tail", -1)
-    if tailn > 0:
-        docker_logs_cmd += ["--tail", str(tailn)]
+class Flukes(object):
 
-    q = Queue.Queue()
-    for container in containers:
-        container_colors[container] = cp.pick()
-        p = subprocess.Popen(docker_logs_cmd + [container],
+    def enqueue_output_container(self, out, queue, container):
+        for line in iter(out.readline, b''):
+            queue.put({"line": line, "container":container})
+        out.close()
+
+    def enqueue_output(self, out, queue):
+        for line in iter(out.readline, b''):
+            queue.put(line)
+        out.close()
+
+    def __init__(self, containers, watch=False, tail=0):
+
+        self.cp = ColorPicker()
+
+        self.container_colors = {}
+        self.log_q = Queue.Queue()
+        self.event_q = Queue.Queue()
+
+        self.tail = tail
+        self.containers = containers
+
+        if containers == ALL_CONTAINERS:
+            o = subprocess.check_output("docker ps --format '{{.Names}}'", shell=True)
+            self.containers = o.split("\n")
+
+        for container in self.containers:
+            self.add_container(container, self.tail)
+
+        if watch:
+            self.watch = True
+            self.setup_event_watcher()
+
+    def setup_event_watcher(self):
+        p = subprocess.Popen(["docker", "events", "--filter", "event=start"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 bufsize=1,
-                close_fds='posix' in sys.builtin_module_names) # Don't close fds on windows.. Dunno why..
-                                                               # Trusting stackoverflow until they've been
-                                                               # been proven wrong on this
-        t = threading.Thread(target=enqueue_output, args=(p.stdout, q, container))
+                close_fds='posix' in sys.builtin_module_names)
+        t = threading.Thread(target=self.enqueue_output,
+                             args=(p.stdout, self.event_q))
         t.daemon = True
         t.start()
 
-    while 1:
-        # Read line async
-        try:
-            x = q.get_nowait()
-        except Queue.Empty:
-            # Sleep a bit during "slow" periods.
-            # Makes our tight loop a bit less tight and saves some battery :)
-            time.sleep(0.1)
-        else:
-            container = x["container"]
-            sys.stdout.write(colored(container + ": ", container_colors[container]) + x["line"])
+    def add_container(self, container, tail=0):
+        self.container_colors[container] = self.cp.pick()
+
+        cmd = ["docker", "logs", "-f"]
+        if tail > 0:
+            cmd += ["--tail", str(tail)]
+        cmd += [container]
+
+        p = subprocess.Popen(cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=1,
+                close_fds='posix' in sys.builtin_module_names)
+        t = threading.Thread(target=self.enqueue_output_container,
+                             args=(p.stdout, self.log_q, container))
+        t.daemon = True
+        t.start()
+
+    def run(self):
+        while 1:
+            # Read line async
+            try:
+                x = self.log_q.get_nowait()
+            except Queue.Empty:
+                # Sleep a bit during "slow" periods.
+                # Makes our tight loop a bit less tight and saves some battery :)
+                time.sleep(0.1)
+            else:
+                container = x["container"]
+                sys.stdout.write(colored(container + ": ", self.container_colors[container]) + x["line"])
+
+            if self.watch:
+                self.process_events()
+                continue
+
+    def process_events():
+        while 1:
+            try:
+                line = self.event_q.get_nowait()
+            except Queue.Empty:
+                break
+            else:
+                container_id = re.findall(r'[a-f0-9]{64}', line)[0]
+                name = self.container_name(container_id)
+                print("FLUKES: Adding container " + name)
+                self.add_container(name)
+
+    def container_name(self, container_id):
+        cmd = "docker inspect --format '{{.Name}}' %s" % container_id
+        name = subprocess.check_output(cmd, shell=True)
+        name = [1:].strip() # Remove whitespace and leading slash
+        return name
+
 
 def main():
     argp = argparse.ArgumentParser()
@@ -104,14 +167,18 @@ def main():
         help="Containers to tail logs from. Defaults to all running containers.")
     argp.add_argument("-t", "--tail", type=int, default=-1,
         help="Number of lines to tail (passed to 'docker logs')")
+    argp.add_argument("-w", "--watch", action="store_true",
+        help="Watch for new containers starting")
     args = argp.parse_args()
 
     containers = args.containers
 
+    t = None
     if args.containers == "all":
-        o = subprocess.check_output("docker ps --format '{{.Names}}'", shell=True)
-        containers = o.split("\n")
-    tail_container_logs(containers, tail=args.tail)
+        t = Flukes(ALL_CONTAINERS, tail=args.tail, watch=args.watch)
+    else:
+        t = Flukes(args.containers, tail=args.tail, watch=args.watch)
+    t.run()
 
 if __name__ == "__main__":
     main()
